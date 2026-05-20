@@ -1,140 +1,55 @@
-# squash_ticket
+# squash-ticket
 
-Intégration Squash TM → tool-bug-tracker : création automatique de tickets lors des échecs d'exécution de tests.
+Service de polling qui détecte les échecs d'exécution dans **Squash TM** et crée automatiquement des tickets dans **tool-bug-tracker**.
 
----
-
-## Principe
-
-Lorsqu'une exécution de test échoue dans Squash TM, un **webhook** est envoyé automatiquement au backend NestJS de **tool-bug-tracker**, qui crée un ticket de bug pré-rempli avec les informations de l'exécution.
+## Fonctionnement
 
 ```
-Squash TM (échec d'exécution)
-       │  POST /squash/webhook
-       ▼
-NestJS backend (tool-bug-tracker)
-  → vérifie le secret
-  → identifie l'application (via application_squash)
-  → déduplique si ticket déjà ouvert
-  → crée le ticket automatiquement
+Toutes les N secondes :
+  1. GET /api/executions (Squash TM) → filtre status=FAILURE
+  2. Ignore les exécutions déjà traitées (state.json)
+  3. POST /ticket/create (tool-bug-tracker) → crée le ticket
+  4. Sauvegarde l'état → évite les doublons
 ```
 
----
+## Déploiement via Docker
 
-## Configuration côté Squash TM
+Le service est intégré dans le `docker-compose.yml` de **tool-bug-tracker**.
 
-### Prérequis
+Créer un fichier `.env` à la racine du projet `tool-bug-tracker` (ou compléter l'existant) :
 
-Squash TM **>= 1.21** (webhooks natifs).
-
-### 1. Créer le webhook
-
-Dans **Administration > Webhooks**, ajouter un webhook avec ces paramètres :
-
-| Champ | Valeur |
-|-------|--------|
-| URL | `http://<bug-tracker-host>:3000/squash/webhook` |
-| Événements | `EXECUTION_STATUS_CHANGED` |
-| En-tête personnalisé | `X-Squash-Secret: <votre-secret>` |
-
-### 2. Filtrer les statuts déclencheurs
-
-Configurez le webhook pour ne se déclencher que sur les statuts :
-- `FAILURE` — exécution en échec
-- `BLOCKED` — exécution bloquée
-
----
-
-## Configuration côté tool-bug-tracker
-
-### Variables d'environnement (`backend/.env`)
-
-| Variable | Exemple | Description |
-|----------|---------|-------------|
-| `SQUASH_WEBHOOK_SECRET` | `mon-secret-fort` | Secret partagé pour authentifier les appels Squash TM |
-| `SQUASH_DEFAULT_STATUS_ID` | `3` | ID du statut attribué aux tickets créés (ex : "Nouveau") |
-| `SQUASH_DEFAULT_IMPORTANCE_ID` | `1` | ID de l'importance attribuée par défaut (ex : "Normal") |
-
-> Les IDs de statut et d'importance sont ceux de votre base de données. Vérifiez-les dans **Admin > Statuts** et **Admin > Importances**.
-
-### Associer les projets Squash aux applications
-
-Dans l'admin du bug tracker (`/admin`), section **Projets Squash**, associer chaque projet Squash TM à l'application métier correspondante.
-
-Le webhook utilise cette correspondance pour renseigner automatiquement le champ **Application** du ticket créé.
-
----
-
-## Format du webhook Squash TM
-
-Le backend accepte le payload suivant (format standard Squash TM) :
-
-```json
-{
-  "execution": {
-    "executionStatus": "FAILURE",
-    "testCase": {
-      "id": 123,
-      "name": "TC_001 - Login utilisateur",
-      "project": {
-        "id": 1,
-        "name": "Mon Projet"
-      }
-    },
-    "steps": [
-      {
-        "id": 456,
-        "index": 2,
-        "executionStatus": "FAILURE",
-        "comment": "Assertion failed: expected 200 but got 500"
-      }
-    ],
-    "campaign": { "name": "Campagne Sprint 12" },
-    "iteration": { "name": "Itération 1" }
-  }
-}
+```env
+SQUASH_TOKEN=eyJ...          # même valeur que VITE_SQUASH_TOKEN
+DEFAULT_STATUS_ID=3          # ID du statut "Nouveau"
+DEFAULT_IMPORTANCE_ID=1      # ID de l'importance par défaut
+POLL_INTERVAL_SECONDS=120    # polling toutes les 2 minutes
 ```
 
----
+Puis lancer :
 
-## Comportement de l'endpoint
+```bash
+docker compose up -d squash-ticket
+```
 
-**Endpoint** : `POST /squash/webhook`
+## Variables d'environnement
 
-**Headers requis** :
-- `Content-Type: application/json`
-- `X-Squash-Secret: <secret>` (si `SQUASH_WEBHOOK_SECRET` est configuré)
+| Variable | Défaut | Description |
+|----------|--------|-------------|
+| `SQUASH_BASE_URL` | — | URL Squash TM (ex: `https://squashtm.groupebovis.local`) |
+| `SQUASH_TOKEN` | — | Token JWT d'accès à l'API Squash TM |
+| `BUG_TRACKER_URL` | `http://backend:3000` | URL interne du backend (nom service Docker) |
+| `DEFAULT_STATUS_ID` | `3` | ID du statut attribué aux tickets créés |
+| `DEFAULT_IMPORTANCE_ID` | `1` | ID de l'importance attribuée par défaut |
+| `POLL_INTERVAL_SECONDS` | `120` | Intervalle de polling en secondes |
 
-**Réponses** :
+## Persistance
 
-| Cas | Réponse |
-|-----|---------|
-| Ticket créé | `{ "created": true, "ticketId": 42 }` |
-| Ticket déjà existant (déduplication) | `{ "skipped": true, "existingTicketId": 42 }` |
-| Statut non concerné (SUCCESS, etc.) | `{ "ignored": true, "reason": "..." }` |
-| Secret invalide | `401 Unauthorized` |
+L'état du polling (`lastPollAt` + liste des IDs traités) est stocké dans `/app/data/state.json` à l'intérieur du conteneur — le volume Docker `squash_ticket_data` assure la persistance entre les redémarrages.
 
-### Déduplication
+## Adapter l'endpoint Squash TM
 
-Si un ticket **actif** existe déjà pour le même cas de test Squash TM (même `TIC_SQUASH_TEST_CASE`), aucun nouveau ticket n'est créé. Cela évite les doublons lors d'exécutions répétées sur un même cas de test défaillant.
-
----
-
-## Ticket créé dans tool-bug-tracker
-
-Exemple de ticket généré automatiquement :
-
-- **Titre** : `[Squash] Échec : TC_001 - Login utilisateur`
-- **Description** :
-  ```
-  **Exécution Squash TM — statut : FAILURE**
-  
-  **Campagne** : Campagne Sprint 12 / Itération 1
-  **Projet Squash** : Mon Projet
-  **Cas de test** : TC_001 - Login utilisateur (ID : 123)
-  
-  **Étape en échec** : #2
-  **Commentaire** : Assertion failed: expected 200 but got 500
-  ```
-- **Lien Squash** : rempli automatiquement (cas de test + étape)
-- **Application** : mappée depuis le projet Squash
+Si l'endpoint `GET /api/executions` ne fonctionne pas avec votre version, vérifiez l'API disponible sur :
+```
+https://squashtm.groupebovis.local/squash/swagger-ui.html
+```
+Puis ajuster `src/squash-client.js` en conséquence.
